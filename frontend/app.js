@@ -5,7 +5,9 @@ const sendBtn = document.getElementById("sendBtn");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
 // WebSocket connection
 
-const ws = new WebSocket(`ws://${location.hostname}:3000`);
+const ws = new WebSocket(
+  window.location.origin.replace("http", "ws")
+);
 
 ws.onopen = () => {
   console.log("Connected to AI backend");
