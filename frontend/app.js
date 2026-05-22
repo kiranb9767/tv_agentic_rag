@@ -3,11 +3,25 @@ const input = document.getElementById("input");
 const sendBtn = document.getElementById("sendBtn");
 
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+
+
+let sessionId = localStorage.getItem("sessionId");
+
+if (!sessionId) {
+  sessionId =
+  "session_" +
+  Math.random()
+    .toString(36)
+    .substring(2) +
+  Date.now();
+  localStorage.setItem("sessionId",sessionId);
+}
+
 // WebSocket connection
 
-const ws = new WebSocket(
-  window.location.origin.replace("http", "ws")
-);
+const ws = new WebSocket(window.location.origin.replace("http", "ws"));
+
+//const ws = new WebSocket("ws://172.27.195.9:3000");
 
 ws.onopen = () => {
   console.log("Connected to AI backend");
@@ -46,36 +60,32 @@ ws.onmessage = (event) => {
 };
 
 
-sendBtn.addEventListener("click", (e) => {
-    if (e.key === "Enter") {
-        e.preventDefault();
-        sendMessage();  
-    }
-});
-sendBtn.addEventListener("enter", (e) => {
-    if (e.key === "Enter") {
-        e.preventDefault();
-        sendMessage();  
-    }
-});
-sendBtn.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-        e.preventDefault();
-        sendMessage();   
-    }
-});
+sendBtn.addEventListener(
+  "click",
+  () => {
+    sendMessage();
+  }
+);
+
 clearHistoryBtn.addEventListener("click", () => {
-  ws.send(JSON.stringify({ type: "clear_history" }));
+  ws.send(JSON.stringify({ type: "clear_history", sessionId: sessionId }));
   chat.innerHTML = "";
 });
 
-
-
+input.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+);
 
 function sendMessage() {
   const text = input.value.trim();
   addMessage("User", text, "user");
-  ws.send(JSON.stringify({ type: "question", message: text }));
+  ws.send(JSON.stringify({ type: "question", message: text, sessionId: sessionId }));
   input.value = "";
 }
 

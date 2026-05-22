@@ -16,6 +16,8 @@ import { OpenAIEmbeddings } from "@langchain/openai";
 import { WebSocketServer } from "ws";
 import { TavilySearch } from "@langchain/tavily";
 import { StateGraph, Annotation } from "@langchain/langgraph";
+import { MemorySaver } from "@langchain/langgraph";
+import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb";
 
 import { MongoClient } from "mongodb";
 import express from "express";
@@ -23,10 +25,6 @@ import http from "http";
 
 import path from "path";
 import { fileURLToPath } from "url";
-
-import { ContextualCompressionRetriever } from "@langchain/classic/retrievers/contextual_compression";
-
-import { LLMChainExtractor } from "@langchain/classic/retrievers/document_compressors/chain_extract";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,6 +40,8 @@ const limiter = rateLimit({
   max: 30,
   message: "Too many requests",
 });
+
+
 
 exapp.use(limiter);
 
@@ -71,16 +71,27 @@ console.log("Connected to MongoDB");
 
 const db = mongoClient.db(process.env.MONGODB_DB_NAME);
 
+const checkpointer =
+  new MongoDBSaver({
+    client: mongoClient,
+    dbName: process.env.MONGODB_DB_NAME,
+  });
+
 const conversationHistory = db.collection("conversation_history");
+
 
 const GraphState = Annotation.Root({
   Question: Annotation,
+  RagContext: Annotation,
+  WebContext: Annotation,
+  FinalContext: Annotation,
   Answer: Annotation,
   Confidence: Annotation,
   error: Annotation,
   strategy: Annotation,
   ragQuery: Annotation,
   webQuery: Annotation,
+  RetrievalScore: Annotation,
 });
 
 const embeddings = new OpenAIEmbeddings({
@@ -104,9 +115,11 @@ const groqLlm = new ChatGroq({
   temperature: 0,
   streaming: true,
   maxTokens: 500,
-}).withRetry({
+})
+  .withRetry({
     stopAfterAttempt: 3,
-  }).withConfig({
+  })
+  .withConfig({
     timeout: 8000,
   });
 
@@ -123,13 +136,14 @@ function xmlParseToString() {
 
   const result = {};
   const chapters = xmlData.match(/<chapter[^>]*>[\s\S]*?<\/chapter>/g) || [];
+
   chapters.forEach((chapter) => {
     const title = chapter.match(/title="([^"]+)"/)?.[1]?.trim() || "";
-    const models = [...chapter.matchAll(/<diversity>(.*?)<\/diversity>/g)].map(
-      (m) => m[1],
-    );
+
+    const models = [...chapter.matchAll(/<diversity>(.*?)<\/diversity>/g)].map((m) => m[1],);
 
     const src = chapter.match(/src="([^"]+)"/)?.[1]?.trim() || "";
+
     const fileName = src.split("/").pop();
 
     result[fileName] = {
@@ -169,10 +183,9 @@ async function uploadDocuments() {
       const filePath = `${folderPath}/${file}`;
       const htmlContent = fs.readFileSync(filePath, "utf8");
       const text = extractTextFromHtml(htmlContent);
-
       documents.push(
-        new Document({pageContent: text
-          ,
+        new Document({
+          pageContent: text,
           metadata: {
             source: file,
             language: current_lang_iso.toUpperCase(),
@@ -182,59 +195,36 @@ async function uploadDocuments() {
         }),
       );
     }
-
     const textSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 400,
-      chunkOverlap: 80,
+      chunkSize: 1000,
+      chunkOverlap: 150,
     });
 
     const chunks = await textSplitter.splitDocuments(documents);
-
     await index.deleteAll();
     await vectorStore.addDocuments(chunks);
-
     console.log("Upload successful!");
   } catch (e) {
     console.log("UPLOAD ERROR:", e);
   }
 }
 
-/*
-await uploadDocuments();
-*/
-
-const baseRetriever = vectorStore.asRetriever({
-  searchType: "mmr",
-  k: 8,
-});
-
-const compressor = LLMChainExtractor.fromLLM(groqLlm);
-
-const compressionRetriever = new ContextualCompressionRetriever({
-  baseRetriever,
-  baseCompressor: compressor,
-});
+//await uploadDocuments();
 
 async function retriveRelevantDocuments(query) {
-  const docs = await compressionRetriever.invoke(query);
 
-  return docs.slice(0, 5);
-}
+  const results = await vectorStore.similaritySearchWithScore(query,5);
+  const docs = results.map((r) => r[0]);
+  const scores = results.map((r) => r[1]);
 
-async function compressContext(question, docs) {
-  const compressed = await groqLlm.invoke([
-    new SystemMessage(`
-      Extract ONLY useful information related to the user question.
-      Remove unrelated details.
-      Keep concise.`),
+  console.log("RETRIEVAL SCORES:",scores);
 
-    new HumanMessage(`
-      Question:
-        ${question}
-      Documents:
-        ${docs.map((d) => d.pageContent).join("\n")}`),
-  ]);
-  return compressed.content;
+  const topScore = scores[0] || 0;
+
+  return {
+    docs,
+    topScore,
+  };
 }
 
 const BAD_WORDS = ["fuck", "shit", "idiot", "bastard", "asshole"];
@@ -243,6 +233,7 @@ function inputGuardNode(state) {
   const abusive = BAD_WORDS.some((word) =>
     state.Question.toLowerCase().includes(word),
   );
+
   if (abusive) {
     return {
       ...state,
@@ -251,223 +242,126 @@ function inputGuardNode(state) {
       Confidence: 1,
     };
   }
+
   return state;
 }
 
 async function plannerNode(state) {
+
   try {
-    const result = await groqLlm.invoke([
-      new SystemMessage(`
-You are a routing planner.
 
-Your job is to decide whether the question should use:
+    const retrievalScore = state.RetrievalScore || 0;
 
-1. RAG_ONLY
-- when internal knowledge/documents are enough
+    const ragContext = state.RagContext || "";
 
-2. WEB_ONLY
-- when external/public/latest internet information is required
+    console.log("Planner Retrieval Score:",retrievalScore);
 
-3. RAG_AND_WEB
-- when both internal docs and internet information are needed
+    const plannerResult =
+      await groqLlm.invoke([
 
-Return ONLY valid JSON.
+        new SystemMessage(`
+          You are a smart query routing planner.
 
-Format:
-{
- "strategy":"RAG_ONLY|WEB_ONLY|RAG_AND_WEB",
- "ragQuery":"",
- "webQuery":""
-}
+          Decide the BEST strategy.
 
-Rules:
-- Questions about uploaded manuals, setup, troubleshooting, settings, device features usually use RAG_ONLY
-- Questions requiring latest/public/general internet information use WEB_ONLY
-- If both sources are useful use RAG_AND_WEB
-- Do not explain anything
-- Return JSON only
-`),
+          Available strategies:
 
-      new HumanMessage(`
-Question:
-${state.Question}
-`),
-    ]);
+          1. SMALL_TALK
+             Use when user is:
+             - greeting
+             - introducing themselves
+             - casual chatting
+             - thanking
+             - conversational reply
+             - identity statement
+
+             Examples:
+             - hi
+             - hello
+             - my name is kiran
+             - thanks
+             - nice to meet you
+             - how are you
+
+          2. RAG_ONLY
+             Use when:
+             - Philips TV manual
+             - settings
+             - troubleshooting  
+             - installation
+             - device features
+             - remote issues
+             - HDMI/WiFi/display/audio
+             - internal documentation enough
+
+          3. WEB_ONLY
+             Use when:
+             - latest news
+             - realtime/current info
+             - public internet knowledge
+             - weather
+             - stock/news/sports
+
+          4. RAG_AND_WEB
+             Use when both manual docs and web help.
+
+          IMPORTANT RULES:
+          - Prefer SMALL_TALK for conversational input
+          - Prefer RAG_ONLY for device/manual questions
+          - Be conservative with WEB
+          - Low retrieval score alone DOES NOT mean WEB_ONLY
+          - Use retrieval score as supporting signal only
+
+          Return ONLY valid JSON.
+
+          Format:
+          {"strategy":"SMALL_TALK|RAG_ONLY|WEB_ONLY|RAG_AND_WEB"}
+        `),
+
+        new HumanMessage(`
+          USER QUESTION:${state.Question}
+          RETRIEVAL SCORE:${retrievalScore}
+          RETRIEVED MANUAL CONTEXT:${ragContext}`),
+      ]);
 
     let parsed;
-
     try {
-      const cleaned = result.content
-        .replace(/```json/g, "")
-        .replace(/```/g, "")
-        .trim();
+      const cleaned =
+        plannerResult.content
+          .replace(/```json/g, "")
+          .replace(/```/g, "")
+          .trim();
 
       parsed = JSON.parse(cleaned);
-    } catch {
-      parsed = {
-        strategy: "RAG_ONLY",
-
-        ragQuery: state.Question,
-
-        webQuery: state.Question,
-      };
+      console.log("Planner Parsed Result:",parsed);
+    } catch (e) {
+      console.log("Planner Parse Error:",e);
+      parsed = {strategy: "RAG_ONLY",};
     }
 
+    const finalStrategy =parsed.strategy?.trim() || "RAG_ONLY";
+
+    console.log("Final Planner Strategy:",finalStrategy);
     return {
       ...state,
-
-      strategy: parsed.strategy || "RAG_ONLY",
-
-      ragQuery: parsed.ragQuery || state.Question,
-
-      webQuery: parsed.webQuery || state.Question,
+      strategy:finalStrategy,
+      ragQuery:state.Question,
+      webQuery:state.Question,
+      RagContext:ragContext,
     };
-  } catch {
+  } catch (e) {
+    console.log("PLANNER NODE ERROR:",e);
     return {
       ...state,
-
-      strategy: "RAG_ONLY",
-
-      ragQuery: state.Question,
-
-      webQuery: state.Question,
+      strategy:"RAG_ONLY",
+      ragQuery:state.Question,
+      webQuery:state.Question,
+      RagContext:state.RagContext || "",
     };
   }
 }
 
-async function ragNode(state) {
-  if (state.strategy === "WEB_ONLY") {
-    return state;
-  }
-
-  try {
-    const docs = await retriveRelevantDocuments(state.ragQuery);
-
-    return {
-      ...state,
-      RagContext: docs.map((d) => d.pageContent).join("\n"),
-    };
-  } catch {
-    return {
-      ...state,
-      RagContext: "",
-    };
-  }
-}
-
-async function webNode(state, config) {
-  if (state.strategy === "RAG_ONLY") {
-    return state;
-  }
-
-  const ws = config?.configurable?.ws;
-
-  let finalAnswer = "";
-
-  try {
-    const webResult = await webSearchTool.invoke({
-      query: state.webQuery || state.Question,
-    });
-
-    console.log("Web Search Result:", webResult);
-
-    let webContext = "";
-
-    if (Array.isArray(webResult?.results)) {
-      webContext = webResult.results
-        .map(
-          (r) => `
-content: ${r.content || ""}
-url: ${r.url || ""}
-`,
-        )
-        .join("\n");
-    } else {
-      webContext = JSON.stringify(webResult);
-    }
-
-    const result = await groqLlm.stream([
-      new SystemMessage(`
-Answer the user's question using the provided web information.
-
-Rules:
-1. Give direct answer
-2. Use available URLs if relevant
-3. If URL available format as HTML link
-4. Keep answer concise
-5. Do not hallucinate
-
-Example:
-<a href="https://www.netflix.com">Watch Here</a>
-`),
-
-      new HumanMessage(`
-Question:
-${state.Question}
-
-Web information:
-${webContext}
-`),
-    ]);
-
-    for await (const chunk of result) {
-      finalAnswer += chunk.content || "";
-
-      if (ws) {
-        ws.send(
-          JSON.stringify({
-            type: "stream",
-            token: chunk.content || "",
-          }),
-        );
-      }
-    }
-
-    if (ws) {
-      ws.send(
-        JSON.stringify({
-          type: "done",
-        }),
-      );
-    }
-  } catch {
-    finalAnswer = "NOT_SURE";
-  }
-
-  console.log("Web Node Result:", finalAnswer);
-
-  return {
-    ...state,
-
-    WebContext: finalAnswer,
-
-    Answer: finalAnswer,
-
-    Confidence: finalAnswer.includes("NOT_SURE") ? 0.3 : 0.9,
-  };
-}
-
-function mergeNode(state) {
-  return {
-    ...state,
-
-    Context: `
-RAG:
-${state.RagContext || ""}
-
-WEB:
-${state.WebContext || ""}
-`,
-  };
-}
-
-async function answerNode(state, config) {
-  if (state.strategy === "WEB_ONLY") {
-    return {
-      ...state,
-    };
-  }
-
+async function smallTalkNode(state, config) {
   const ws = config?.configurable?.ws;
 
   let finalAnswer = "";
@@ -475,29 +369,19 @@ async function answerNode(state, config) {
   try {
     const result = await groqLlm.stream([
       new SystemMessage(`
-You are the User Manual Assistant for Philips TV.
-
-STRICT RULES:
-1. Answer ONLY from context
-2. Prefer RAG information first
-3. Use WEB only if needed
-4. Keep concise
-5. No hallucination
-`),
-
+          You are a helpful assistant for Philips TV users.
+          Answer the user's question in a friendly manner.
+          Rules:
+            1. Be friendly and helpful
+            2. Keep answers concise
+            3. Do not hallucinate`),
       new HumanMessage(`
-Question:
-${state.Question}
-
-Context:
-${state.Context}
-`),
+          Question:${state.Question}`),
     ]);
 
     for await (const chunk of result) {
       if (chunk.content) {
         finalAnswer += chunk.content;
-
         if (ws) {
           ws.send(
             JSON.stringify({
@@ -516,21 +400,214 @@ ${state.Context}
         }),
       );
     }
+
+  } catch {
+    finalAnswer = "Sorry, I'm having trouble answering that right now.";
+  }
+
+  return {
+    ...state,
+    Answer: finalAnswer,
+    Confidence: 0.9,
+  };
+}
+
+async function ragNode(state) {
+
+  if (state.strategy === "WEB_ONLY") {
+    return state;
+  }
+  try {
+    console.log("RAG Node Invoked with RagQuery:",state.ragQuery);
+
+    return {
+      ...state,
+      RagContext: state.RagContext || "",
+    };
+  } catch {
+    console.log("RAG NODE ERROR:");
+    return {
+      ...state,
+      RagContext: "",
+    };
+  }
+}
+
+async function webNode(state, config) {
+  if (state.strategy === "RAG_ONLY") {
+    return state;
+  }
+
+  const ws = config?.configurable?.ws;
+  let finalAnswer = "";
+
+  try {
+    const webResult = await webSearchTool.invoke({
+        query:
+          state.webQuery ||
+          state.Question,
+      });
+
+    console.log("Web Search Result:",webResult);
+
+    let webContext = "";
+    if (Array.isArray(webResult?.results)) {
+      webContext =webResult.results.map((r) => `
+                  content: ${r.content || ""}
+                  url: ${r.url || ""}`).join("\n");
+    } else {
+      webContext = JSON.stringify(webResult);
+    }
+    if (state.strategy === "WEB_ONLY") {
+      const result = await groqLlm.stream([
+        new SystemMessage(`
+            You are a helpful assistant.
+            Answer the user's question using ONLY the provided web results.
+            Rules:
+              - Keep answer concise
+              If URLs are available:
+              - convert them into clickable HTML links
+              Format:
+              <a href="URL" target="_blank">Open Link</a>
+            - Do not hallucinate
+          - If answer unavailable say:"No reliable web information found."`),
+
+        new HumanMessage(`
+            Question:${state.Question}
+            Web Results:${webContext}`),
+      ]);
+
+      for await (const chunk of result) {
+        if (chunk.content) {
+          finalAnswer +=chunk.content;
+
+          if (ws) {
+            ws.send(
+              JSON.stringify({
+                type: "stream",
+                token:chunk.content,
+              }),
+            );
+          }
+        }
+      }
+
+      if (ws) {
+        ws.send(
+          JSON.stringify({
+            type: "done",
+          }),
+        );
+      }
+
+      return {
+        ...state,
+        WebContext:webContext,
+        Answer:finalAnswer,
+        Confidence: 0.9,
+      };
+    }
+
+    return {
+      ...state,
+      WebContext:webContext,
+    };
+  } catch (e) {
+    console.log("WEB NODE ERROR:",e);
+
+    return {
+      ...state,
+      WebContext: "",
+      Answer:"Unable to fetch web information.",
+      Confidence: 0.3,
+    };
+  }
+}
+
+
+function mergeNode(state) {
+
+  return {
+    ...state,
+    FinalContext: 
+    `MANUAL_CONTEXT:${state.RagContext || ""}
+    WEB_CONTEXT:${state.WebContext || ""}`,
+  };
+}
+
+
+async function answerNode(state, config) {
+
+  if (state.strategy === "WEB_ONLY") {
+    return {
+      ...state,
+    };
+  }
+
+  const ws = config?.configurable?.ws;
+  let finalAnswer = "";
+
+  try {
+    const result = await groqLlm.stream([
+      new SystemMessage(`
+          You are a Philips TV manual assistant.
+          You MUST answer using ONLY the provided context.
+
+          IMPORTANT RULES:
+          - Do NOT use your own knowledge
+          - Do NOT ignore provided context
+          - Treat context as source of truth
+          - Keep concise and user-friendly
+
+          If answer exists:
+          - explain naturally
+          If answer unavailable:
+          - reply:
+         "Information not available in the provided manual."`),
+
+      new HumanMessage(`
+          Question:${state.Question}
+          Context:${state.FinalContext}`),
+    ]);
+
+    for await (const chunk of result) {
+      if (chunk.content) {
+
+        finalAnswer += chunk.content;
+        if (ws) {
+          ws.send(
+            JSON.stringify({
+              type: "stream",
+              token: chunk.content,
+            }),
+          );
+        }
+      }
+    }
+
+    if (ws) {
+      ws.send(
+        JSON.stringify({
+          type: "done",
+        }),
+      );
+    }
+
   } catch {
     finalAnswer = "NOT_SURE";
   }
 
   return {
     ...state,
-
     Answer: finalAnswer,
-
-    Confidence: finalAnswer.includes("NOT_SURE") ? 0.3 : 0.9,
+    Confidence:finalAnswer.includes("NOT_SURE")? 0.3: 0.9,
   };
 }
 
 function guardNode(state) {
+
   if (!state.Answer) {
+
     return {
       ...state,
       error: true,
@@ -538,6 +615,7 @@ function guardNode(state) {
   }
 
   if (state.Confidence && state.Confidence < 0.6) {
+
     return {
       ...state,
       error: true,
@@ -553,7 +631,6 @@ function guardNode(state) {
 function fallbackNode(state) {
   return {
     ...state,
-
     Answer: "Unable to answer safely.",
   };
 }
@@ -564,19 +641,13 @@ const graph = new StateGraph({
 
 graph
   .addNode("INPUT_GUARD", inputGuardNode)
-
   .addNode("PLANNER", plannerNode)
-
   .addNode("RAG", ragNode)
-
   .addNode("WEB", webNode)
-
+  .addNode("SMALL_TALK", smallTalkNode)
   .addNode("MERGE", mergeNode)
-
   .addNode("ANSWER", answerNode)
-
   .addNode("GUARD", guardNode)
-
   .addNode("FALLBACK", fallbackNode);
 
 graph.setEntryPoint("INPUT_GUARD");
@@ -586,33 +657,29 @@ graph.addConditionalEdges(
   (state) => (state.error ? "FALLBACK" : "PLANNER"),
   {
     FALLBACK: "FALLBACK",
-
     PLANNER: "PLANNER",
   },
 );
 
 graph.addConditionalEdges("PLANNER", (state) => state.strategy, {
   RAG_ONLY: "RAG",
-
   WEB_ONLY: "WEB",
-
   RAG_AND_WEB: "RAG",
+  SMALL_TALK: "SMALL_TALK",
 });
 
 graph.addConditionalEdges(
   "RAG",
-  (state) => (state.strategy === "RAG_AND_WEB" ? "WEB" : "MERGE"),
+  (state) =>
+    (state.strategy === "RAG_AND_WEB" ? "WEB": "MERGE"),
   {
     WEB: "WEB",
-
     MERGE: "MERGE",
   },
 );
 
 graph.addEdge("WEB", "MERGE");
-
 graph.addEdge("MERGE", "ANSWER");
-
 graph.addEdge("ANSWER", "GUARD");
 
 graph.addConditionalEdges(
@@ -620,95 +687,244 @@ graph.addConditionalEdges(
   (state) => (state.error ? "FALLBACK" : "__end__"),
   {
     FALLBACK: "FALLBACK",
-
     __end__: "__end__",
   },
 );
 
 graph.addEdge("FALLBACK", "__end__");
 
-const app = graph.compile();
-
-/////////  ws server to handle msg and send rsp////////////////////
-wss.on("connection", async (ws) => {
-  console.log("Web soc server connected......");
-
-  const history = await conversationHistory
-    .find({})
-    .sort({ timestamp: 1 })
-    .toArray();
-
-  console.log("Conversation History:", history);
-
-  ws.send(JSON.stringify({ type: "history", message: history }));
-
-  ws.on("message", async (message) => {
-    console.log("Web soc on msg receive......");
-    const data = JSON.parse(message.toString());
-
-    if (data.type === "clear_history") {
-      await conversationHistory.deleteMany({});
-      console.log("Conversation history cleared.");
-      return;
-    }
-
-    const userQuestion = data.message;
-
-    console.log("User Question: " + userQuestion);
-
-    await conversationHistory.insertOne({
-      role: "user",
-      content: userQuestion,
-      timestamp: new Date(),
-    });
-
-    const docs = await retriveRelevantDocuments(userQuestion);
-
-    const context = docs.map((d) => d.pageContent).join("\n");
-    console.log("Retrieved Context:", context);
-
-    const result = await app.invoke(
-      {
-        Question: userQuestion,
-        Context: context,
-      },
-      {
-        configurable: {
-          ws: ws,
-        },
-      },
-    );
-    console.log("Final Graph Result:", result);
-    await conversationHistory.insertOne({
-      role: "ai",
-      content: result.Answer,
-      timestamp: new Date(),
-    });
-
-    console.log("AI Answer : " + result.Answer);
-  });
+const app = graph.compile({
+    checkpointer: checkpointer,
 });
 
-/*
-Terminal testing
 
-async function userInput() {
+wss.on("connection", async (ws) => {
 
-  return new Promise((resolve) => {
+  console.log(
+    "Web soc server connected......"
+  );
 
-    const readLine =
-      readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
+  ws.on("message", async (message) => {
 
-    readLine.on(
-      "line",
-      async (input) => {
-        resolve(input);
-        readLine.close();
+    try {
+
+      console.log(
+        "Web soc on msg receive......"
+      );
+      const data =
+        JSON.parse(message.toString());
+
+      const sessionId =
+        data.sessionId;
+
+      if (!sessionId) {
+
+        console.log(
+          "Session ID missing"
+        );
+
+        return;
       }
-    );
+
+
+      if (!ws.historySent) {
+
+        const history =
+          await conversationHistory
+            .find({
+              sessionId:
+                sessionId,
+            })
+            .sort({
+              timestamp: 1,
+            })
+            .toArray();
+
+        console.log(
+          "Conversation History:",
+          history
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "history",
+            message: history,
+          })
+        );
+
+        ws.historySent = true;
+      }
+
+
+      if (
+        data.type ===
+        "clear_history"
+      ) {
+
+        await conversationHistory
+          .deleteMany({
+            sessionId:
+              sessionId,
+          });
+
+        console.log(
+          "Conversation history cleared."
+        );
+
+        return;
+      }
+
+
+
+      if (
+        data.type !==
+        "question"
+      ) {
+
+        console.log(
+          "Invalid message type"
+        );
+
+        return;
+      }
+
+
+      const userQuestion =
+        data.message;
+
+      if (!userQuestion) {
+
+        console.log(
+          "Empty question"
+        );
+
+        return;
+      }
+
+      console.log(
+        "User Question:",
+        userQuestion
+      );
+
+
+
+      await conversationHistory
+        .insertOne({
+
+          sessionId:
+            sessionId,
+
+          role: "user",
+
+          content:
+            userQuestion,
+
+          timestamp:
+            new Date(),
+        });
+
+
+
+      const retrievalResult =
+        await retriveRelevantDocuments(
+          userQuestion
+        );
+
+      const docs =
+        retrievalResult.docs;
+
+      const topScore =
+        retrievalResult.topScore;
+
+      const context =
+        docs
+          .map(
+            (d) =>
+              d.pageContent
+          )
+          .join("\n");
+
+      console.log(
+        "Retrieved Context:",
+        context
+      );
+
+      console.log(
+        "Top Retrieval Score:",
+        topScore
+      );
+
+      const result =
+        await app.invoke(
+          {
+            Question:
+              userQuestion,
+
+            RagContext:
+              context,
+
+            RetrievalScore:
+              topScore,
+          },
+          {
+           configurable: {
+              thread_id: String(sessionId),
+              checkpoint_ns: "chat",
+              ws: ws,
+        },
+          }
+        );
+
+      console.log(
+        "Final Graph Result:",
+        result
+      );
+
+
+      await conversationHistory
+        .insertOne({
+
+          sessionId:
+            sessionId,
+
+          role: "ai",
+
+          content:
+            result.Answer,
+
+          timestamp:
+            new Date(),
+        });
+
+      console.log(
+        "AI Answer:",
+        result.Answer
+      );
+
+    } catch (e) {
+
+      console.log(
+        "WS MESSAGE ERROR:",
+        e
+      );
+
+      try {
+
+        ws.send(
+          JSON.stringify({
+            type: "stream",
+            token:
+              "Something went wrong.",
+          })
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "done",
+          })
+        );
+
+      } catch {}
+    }
   });
-}
-*/
+});
